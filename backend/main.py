@@ -10,6 +10,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+import time
+from collections import deque
+import joblib
+import pandas as pd
+from features import window_features, WINDOW_S, STRIDE_S, MIN_ROWS
+
+MODEL_PATH = Path(__file__).parent / "model.joblib"
+bundle = joblib.load(MODEL_PATH)
+ml_model = bundle["model"]
+ML_FEATURES = bundle["features"]
+ML_LABELS = bundle["labels"]
+ML_WINDOW_S = float(bundle.get("window_s", WINDOW_S))
+ML_STRIDE_S = float(bundle.get("stride_s", STRIDE_S))
+
+win_buf: deque[tuple[float, dict]] = deque()
+last_uptime_ms: float | None = None
+last_infer_t: float = 0.0
+ml_state = {"label": "waiting", "conf": 0.0, "probs": {}}
+
 MQTT_HOST, MQTT_PORT = "localhost", 1883
 DB_PATH = Path(__file__).parent / "data" / "cargo.db"
 DB_PATH.parent.mkdir(exist_ok=True)
@@ -56,11 +75,35 @@ def push(msg: dict):
 
 
 def handle_data(payload: bytes):
-    global pending
+    global pending, last_uptime_ms, last_infer_t
     try:
         d = json.loads(payload)
     except ValueError:
         return
+
+    now_s = time.monotonic()
+    up_ms = d.get("uptime_ms")
+    if up_ms is not None and last_uptime_ms is not None and up_ms < last_uptime_ms:
+        win_buf.clear()  # ESP32 rebooted, clear stale buffer
+    if up_ms is not None:
+        last_uptime_ms = up_ms
+
+    win_buf.append((now_s, d))
+    while win_buf and (now_s - win_buf[0][0]) > ML_WINDOW_S:
+        win_buf.popleft()
+
+    if len(win_buf) >= MIN_ROWS and (now_s - last_infer_t) >= ML_STRIDE_S:
+        last_infer_t = now_s
+        w_df = pd.DataFrame([row for _, row in win_buf])
+        feats = window_features(w_df)
+        X = pd.DataFrame([feats])[ML_FEATURES]
+        probs = ml_model.predict_proba(X)[0]
+        best_idx = int(probs.argmax())
+        ml_state["label"] = str(ML_LABELS[best_idx])
+        ml_state["conf"] = round(float(probs[best_idx]), 3)
+        ml_state["probs"] = {str(lbl): round(float(p), 3) for lbl, p in zip(ML_LABELS, probs)}
+        mq.publish("cargo/ml", json.dumps(ml_state))  # optional: also publish to MQTT
+
     ts = datetime.now().isoformat(timespec="milliseconds")
     with lock:
         rec = state["recording"]
@@ -75,9 +118,13 @@ def handle_data(payload: bytes):
         if rec:
             counts[label] += 1
         snapshot = dict(counts)
-    push({"type": "data", "timestamp": ts, "d": d, "recording": rec, "label": state["label"],
-          "session": state["session"], "counts": snapshot, "esp_online": state["esp_online"]})
 
+    push({
+        "type": "data", "timestamp": ts, "d": d,
+        "recording": rec, "label": state["label"], "session": state["session"],
+        "counts": snapshot, "esp_online": state["esp_online"],
+        "ml_label": ml_state["label"], "ml_conf": ml_state["conf"], "ml_probs": ml_state["probs"],
+    })
 
 def on_connect(c, userdata, flags, reason_code, properties):
     c.subscribe([("cargo/data", 0), ("cargo/status", 0)])
